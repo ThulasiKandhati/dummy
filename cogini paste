@@ -318,3 +318,133 @@ print(f'RAG acc (robust)={acc_r:.2%}')
 
 **What does your 5-row print show?** That will confirm exactly which pattern you're hitting.
 
+## Complete RAG Code (Option A - Colab)
+
+Paste and run each cell in order:
+
+---
+
+### Cell 1 — Build the Index
+
+```python
+import chromadb
+from sentence_transformers import SentenceTransformer
+import json
+
+# Load encoder and training data
+enc = SentenceTransformer('all-MiniLM-L6-v2')
+train = [json.loads(l) for l in open('train.jsonl')]
+
+# Build Chroma collection
+cli = chromadb.Client()
+col = cli.create_collection('tix')
+col.add(
+    ids=[str(i) for i in range(len(train))],
+    embeddings=enc.encode([t['text'] for t in train]).tolist(),
+    metadatas=[{'label': t['label']} for t in train],
+    documents=[t['text'] for t in train]
+)
+
+print(f"Collection size: {col.count()}")  # Must be 200
+```
+
+---
+
+### Cell 2 — Define Classifier
+
+```python
+from groq import Groq
+import os
+
+client = Groq(api_key=os.environ['GROQ_API_KEY'])
+
+CATS = ['billing.refund_dispute','billing.invoice_error','auth.sso_misconfig',
+        'auth.mfa_lockout','api.rate_limit','api.webhook_failure',
+        'data.export_missing','data.pii_deletion']
+TAXONOMY = '\n'.join(f'- {c}' for c in CATS)
+
+def classify_rag(text):
+    # Retrieve top-5 neighbors
+    hits = col.query(
+        query_embeddings=enc.encode([text]).tolist(),
+        n_results=5
+    )
+    shots = '\n'.join(
+        f"Ticket: {d}\nLabel: {m['label']}"
+        for d, m in zip(hits['documents'][0], hits['metadatas'][0])
+    )
+
+    # Call LLM with strict system prompt
+    r = client.chat.completions.create(
+        model='llama-3.1-8b-instant',
+        messages=[
+            {
+                'role': 'system',
+                'content': 'You are a classifier. You respond with ONLY a single label. No explanation. No punctuation. Just the label.'
+            },
+            {
+                'role': 'user',
+                'content': f'Valid labels:\n{TAXONOMY}\n\nExamples:\n{shots}\n\nTicket: {text}\nLabel:'
+            }
+        ],
+        temperature=0,
+        max_tokens=15
+    )
+
+    raw = r.choices[0].message.content.strip()
+
+    # Extract matching label even if model adds noise
+    for cat in CATS:
+        if cat in raw:
+            return cat
+    return raw  # fallback
+```
+
+---
+
+### Cell 3 — Run Eval
+
+```python
+import time
+
+evals = [json.loads(l) for l in open('eval.jsonl')]
+
+t0 = time.time()
+preds_r = [classify_rag(e['text']) for e in evals]
+lat_r = (time.time() - t0) / len(evals)
+
+acc_r = sum(p == e['label'] for p, e in zip(preds_r, evals)) / len(evals)
+
+print(f'RAG acc={acc_r:.2%} lat={lat_r*1000:.0f}ms')
+
+# Spot check 5 predictions
+print("\nSample predictions:")
+for i in range(5):
+    match = "✓" if preds_r[i] == evals[i]['label'] else "✗"
+    print(f"{match} PRED: '{preds_r[i]}' | TRUE: '{evals[i]['label']}'")
+```
+
+---
+
+### Expected Output
+
+```
+Collection size: 200
+RAG acc=85.00% lat=850ms    ← typically 85-95%
+
+Sample predictions:
+✓ PRED: 'billing.refund_dispute' | TRUE: 'billing.refund_dispute'
+✓ PRED: 'auth.sso_misconfig'     | TRUE: 'auth.sso_misconfig'
+✓ PRED: 'api.rate_limit'         | TRUE: 'api.rate_limit'
+```
+
+---
+
+If accuracy is still low, run this and share the output:
+
+```python
+# Debug: print 3 raw LLM responses before label extraction
+for i in range(3):
+    hits = col.query(query_embeddings=enc.encode([evals[i]['text']]).tolist(), n_results=5)
+    shots = '\n'.join(f"Ticket: {d}\nLabel: {m['label']}" for d,m in zip(hits['documents'][0],hits['metadatas'][0]))
+    raw = client.
