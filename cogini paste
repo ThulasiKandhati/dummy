@@ -237,3 +237,84 @@ print([m['label'] for m in hits['metadatas'][0]])  # billing.* labels
 
 # 4. Raw LLM
 e.g., 'Step 4 throws ImportError — what am I missing?'
+
+## The One-Line Diagnosis
+
+Run this immediately:
+
+```python
+for i in range(5):
+    print(f"PRED: '{preds_r[i]}'")
+    print(f"TRUE: '{evals[i]['label']}'")
+    print("---")
+```
+
+**Paste the output here**, but here are the most likely patterns:
+
+---
+
+## Pattern 1: Extra prefix text
+```
+PRED: 'The label is billing.refund_dispute'
+TRUE: 'billing.refund_dispute'
+```
+**Fix:**
+```python
+# Extract just the matching label from the response
+def extract_label(raw):
+    for cat in CATS:
+        if cat in raw:
+            return cat
+    return raw.strip()
+
+acc_r = sum(extract_label(p) == e['label'] for p, e in zip(preds_r, evals)) / len(evals)
+print(f'RAG acc (fixed)={acc_r:.2%}')
+```
+
+---
+
+## Pattern 2: Wrong casing or punctuation
+```
+PRED: 'Billing.Refund_Dispute'
+TRUE: 'billing.refund_dispute'
+```
+**Fix:**
+```python
+acc_r = sum(p.strip().lower() == e['label'].lower() 
+            for p, e in zip(preds_r, evals)) / len(evals)
+```
+
+---
+
+## Pattern 3: Newline or whitespace embedded
+```
+PRED: 'billing.refund_dispute\n'
+TRUE: 'billing.refund_dispute'
+```
+**Fix** — already handled by `.strip()`, but double-check your `classify_rag` returns:
+```python
+return r.choices[0].message.content.strip().split('\n')[0].strip()
+```
+
+---
+
+## Universal Fix — Apply All At Once
+
+Replace your accuracy line with this robust version that handles all patterns:
+
+```python
+def extract_label(raw):
+    raw = raw.strip().lower()
+    for cat in CATS:
+        if cat.lower() in raw:
+            return cat
+    return raw  # fallback — will still count as wrong if no match
+
+acc_r = sum(extract_label(p) == e['label'] for p, e in zip(preds_r, evals)) / len(evals)
+print(f'RAG acc (robust)={acc_r:.2%}')
+```
+
+---
+
+**What does your 5-row print show?** That will confirm exactly which pattern you're hitting.
+
