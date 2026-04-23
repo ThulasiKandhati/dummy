@@ -1,0 +1,115 @@
+The Three Levers Decision Lab: Prompt vs RAG vs Fine-tune on the Same Task
+A head-to-head comparison harness that attacks one behavior gap (structured customer-support triage with a company-specific taxonomy) using all three levers — prompting, retrieval, and LoRA fine-tuning — measured on the same eval set. You produce a decision matrix with accuracy, latency, cost-per-1k-calls, and ops burden, then write a go/no-go memo.
+Most engineers reach for fine-tuning when prompting or retrieval would solve the problem cheaper, faster, and without lock-in. Running all three on identical data makes the tradeoffs visceral instead of theoretical.
+Time: 90-120 minutes
+Covers: c1, c2, c3
+Prerequisites
+Python 3.10+ and a free Groq or OpenAI API key
+HuggingFace account with access token (read)
+Familiarity with basic pandas and Jupyter
+I have all prerequisites ready
+Option A: Colab T4 + Unsloth LoRA + Groq (prompt/RAG inference) + Chroma
+Option B: Kaggle P100 + LlamaIndex + Qdrant + HF PEFT
+Compute: Google Colab free T4 (16GB) for training; Groq free tier for prompt+RAG
+Cost: Free
+Tooling: Unsloth (Llama-3.2-3B LoRA), Groq API (Llama-3.1-8B), Chroma, sentence-transformers
+Tradeoffs: Unsloth is the fastest path to a working LoRA on T4; Groq gives free, fast inference for the prompt and RAG arms so you compare apples-to-apples on latency.
+Setup
+Open a fresh Colab notebook, set runtime to T4 GPU
+pip install -q unsloth groq chromadb sentence-transformers pandas datasets
+Set env vars: GROQ_API_KEY and HF_TOKEN
+Steps
+1
+Build a 200-row synthetic support-ticket dataset with 8 company-specific categories (e.g., 'billing.refund_dispute', 'auth.sso_misconfig') and a 40-row held-out eval split.
+from datasets import Dataset
+import pandas as pd, random, json
+random.seed(0)
+CATS = ['billing.refund_dispute','billing.invoice_error','auth.sso_misconfig','auth.mfa_lockout','api.rate_limit','api.webhook_failure','data.export_missing','data.pii_deletion']
+templates = {c: [f'Customer says: issue with {c.replace("."," ")}. Details: ticket #{i}' for i in range(30)] for c in CATS}
+rows = [{'text': t, 'label': c} for c, ts in templates.items() for t in ts]
+random.shuffle(rows)
+train, eval_ = rows[:200], rows[200:240]
+pd.DataFrame(eval_).to_json('eval.jsonl', orient='records', lines=True)
+pd.DataFrame(train).to_json('train.jsonl', orient='records', lines=True)
+eval.jsonl has 40 lines; train.jsonl has 200 lines; 8 unique labels in each.
+2
+Lever 1 — Prompting: classify eval set with Llama-3.1-8B on Groq using a zero-shot prompt that lists the taxonomy inline.
+from groq import Groq
+import os, json, time
+client = Groq(api_key=os.environ['GROQ_API_KEY'])
+TAXONOMY = '\n'.join(f'- {c}' for c in CATS)
+def classify_prompt(text):
+    r = client.chat.completions.create(model='llama-3.1-8b-instant',
+        messages=[{'role':'user','content':f'Classify into exactly one label:\n{TAXONOMY}\n\nTicket: {text}\nLabel:'}],
+        temperature=0, max_tokens=20)
+    return r.choices[0].message.content.strip()
+evals = [json.loads(l) for l in open('eval.jsonl')]
+t0=time.time(); preds_p=[classify_prompt(e['text']) for e in evals]; lat_p=(time.time()-t0)/len(evals)
+acc_p = sum(p.strip()==e['label'] for p,e in zip(preds_p,evals))/len(evals)
+print(f'PROMPT acc={acc_p:.2%} lat={lat_p*1000:.0f}ms')
+Prints accuracy (typically 50-75%) and per-request latency; notice it struggles with lookalike labels.
+3
+Lever 2 — Retrieval: index the 200 training examples in Chroma, retrieve top-5 neighbors as few-shot examples, then classify.
+import chromadb
+from sentence_transformers import SentenceTransformer
+enc = SentenceTransformer('all-MiniLM-L6-v2')
+cli = chromadb.Client(); col = cli.create_collection('tix')
+train = [json.loads(l) for l in open('train.jsonl')]
+col.add(ids=[str(i) for i in range(len(train))], embeddings=enc.encode([t['text'] for t in train]).tolist(),
+        metadatas=[{'label':t['label']} for t in train], documents=[t['text'] for t in train])
+def classify_rag(text):
+    hits = col.query(query_embeddings=enc.encode([text]).tolist(), n_results=5)
+    shots='\n'.join(f"Ticket: {d}\nLabel: {m['label']}" for d,m in zip(hits['documents'][0],hits['metadatas'][0]))
+    r = client.chat.completions.create(model='llama-3.1-8b-instant',
+        messages=[{'role':'user','content':f'{TAXONOMY}\n\nExamples:\n{shots}\n\nTicket: {text}\nLabel:'}], temperature=0, max_tokens=20)
+    return r.choices[0].message.content.strip()
+t0=time.time(); preds_r=[classify_rag(e['text']) for e in evals]; lat_r=(time.time()-t0)/len(evals)
+acc_r = sum(p==e['label'] for p,e in zip(preds_r,evals))/len(evals)
+print(f'RAG acc={acc_r:.2%} lat={lat_r*1000:.0f}ms')
+RAG accuracy jumps notably (often 85-95%) with modest latency increase — this is your 'do you even need fine-tuning?' moment.
+4
+Lever 3 — Fine-tune: LoRA-tune Llama-3.2-3B on the 200 training rows with Unsloth (rank 16, 2 epochs).
+from unsloth import FastLanguageModel
+from trl import SFTTrainer
+from transformers import TrainingArguments
+model, tok = FastLanguageModel.from_pretrained('unsloth/Llama-3.2-3B-Instruct', max_seq_length=512, load_in_4bit=True)
+model = FastLanguageModel.get_peft_model(model, r=16, lora_alpha=16, target_modules=['q_proj','k_proj','v_proj','o_proj'])
+def fmt(ex): return {'text': f"<|user|>Classify: {ex['text']}<|assistant|>{ex['label']}<|end|>"}
+ds = Dataset.from_list(train).map(fmt)
+trainer = SFTTrainer(model=model, tokenizer=tok, train_dataset=ds, dataset_text_field='text',
+    args=TrainingArguments(per_device_train_batch_size=4, gradient_accumulation_steps=2,
+        num_train_epochs=2, learning_rate=2e-4, output_dir='out', logging_steps=10, fp16=True))
+trainer.train()
+Training loss drops below 0.3; adapter saved to ./out. GPU memory stays under 15GB on T4.
+5
+Evaluate the fine-tuned model on the same 40-row eval set, capturing accuracy and latency.
+FastLanguageModel.for_inference(model)
+def classify_ft(text):
+    ids = tok(f'<|user|>Classify: {text}<|assistant|>', return_tensors='pt').to('cuda')
+    out = model.generate(**ids, max_new_tokens=20, temperature=0.0, do_sample=False)
+    return tok.decode(out[0][ids.input_ids.shape[1]:], skip_special_tokens=True).split('<')[0].strip()
+t0=time.time(); preds_f=[classify_ft(e['text']) for e in evals]; lat_f=(time.time()-t0)/len(evals)
+acc_f = sum(p==e['label'] for p,e in zip(preds_f,evals))/len(evals)
+print(f'FT acc={acc_f:.2%} lat={lat_f*1000:.0f}ms')
+Fine-tuned accuracy printed; compare to RAG — if FT beats RAG by <3pp, the delta likely doesn't justify the ops cost.
+6
+Build the decision matrix and write a go/no-go memo weighing accuracy delta vs ops burden (weights hosting, eval drift, base-model upgrades, lock-in).
+import pandas as pd
+# Rough cost model: Groq ~free; FT self-hosted ~$0.10/hr T4 = $0.000028/sec
+cost_groq = 0.00  # free tier
+cost_ft_per_call = (lat_f) * 0.000028
+df = pd.DataFrame([
+  {'lever':'Prompt',    'acc':acc_p, 'lat_ms':lat_p*1000, '$/1k':cost_groq, 'ops':'none', 'lock_in':'none'},
+  {'lever':'RAG',       'acc':acc_r, 'lat_ms':lat_r*1000, '$/1k':cost_groq, 'ops':'index refresh', 'lock_in':'low'},
+  {'lever':'Fine-tune', 'acc':acc_f, 'lat_ms':lat_f*1000, '$/1k':cost_ft_per_call*1000, 'ops':'weights+evals+drift+GPU', 'lock_in':'high'}])
+print(df.to_markdown(index=False))
+df.to_csv('decision_matrix.csv', index=False)
+memo = f'''# Go/No-Go Memo\nBest accuracy: {df.loc[df.acc.idxmax(),"lever"]} @ {df.acc.max():.1%}\nAccuracy delta FT vs RAG: {(acc_f-acc_r)*100:+.1f}pp\nRecommendation: {"Ship RAG" if acc_f-acc_r < 0.03 else "Fine-tune justified"} — FT adds weights hosting, eval pipeline, drift monitoring, and blocks easy base-model upgrades.'''
+open('MEMO.md','w').write(memo); print(memo)
+decision_matrix.csv and MEMO.md exist; memo explicitly names the delta and the ops tradeoffs.
+You're done when
+All three levers evaluated on the identical 40-row eval split with temperature=0
+RAG accuracy > Prompt accuracy by at least 10pp (proves retrieval handles the 'company-specific taxonomy' gap)
+MEMO.md states the FT-vs-RAG accuracy delta numerically and ties the recommendation to a 3pp threshold + named ops costs
+Expected output: A decision_matrix.csv comparing accuracy, latency, $/1k calls, ops burden, and lock-in across the three levers on the same task, plus a MEMO.md with an explicit go/no-go recommendation grounded in the measured delta.
+Stretch: Add a 4th row: try to teach the model a NEW fact via fine-tuning (e.g., 'our refund SLA is 7 days') with 50 examples, then eval recall. Observe it fails or hallucinates — confirming fine-tuning is for style/format, not facts. Compare to a 1-document RAG solution that nails it.
