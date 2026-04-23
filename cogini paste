@@ -113,3 +113,127 @@ RAG accuracy > Prompt accuracy by at least 10pp (proves retrieval handles the 'c
 MEMO.md states the FT-vs-RAG accuracy delta numerically and ties the recommendation to a 3pp threshold + named ops costs
 Expected output: A decision_matrix.csv comparing accuracy, latency, $/1k calls, ops burden, and lock-in across the three levers on the same task, plus a MEMO.md with an explicit go/no-go recommendation grounded in the measured delta.
 Stretch: Add a 4th row: try to teach the model a NEW fact via fine-tuning (e.g., 'our refund SLA is 7 days') with 50 examples, then eval recall. Observe it fails or hallucinates — confirming fine-tuning is for style/format, not facts. Compare to a 1-document RAG solution that nails it.
+## Diagnosing RAG Accuracy = 0% with BERT Load Warning
+
+This is a classic symptom of the **embedding model failing silently** — Chroma/Qdrant stores garbage vectors, retrieval returns wrong neighbors, few-shot examples are irrelevant, and the LLM guesses randomly.
+
+---
+
+## Step 1: Confirm the Embedding Model Actually Loaded
+
+Run this **before** your RAG code:
+
+```python
+from sentence_transformers import SentenceTransformer
+enc = SentenceTransformer('all-MiniLM-L6-v2')
+
+# Smoke test
+test_vec = enc.encode(["test ticket"])
+print("Shape:", test_vec.shape)        # Should be (1, 384)
+print("First 5 values:", test_vec[0][:5])  # Should be real floats, not zeros
+```
+
+**If you see the "unexpected status" warning**, it's usually one of these:
+
+---
+
+## Fix A: Missing `transformers` version (most common on Colab)
+
+```python
+pip install -q sentence-transformers transformers torch --upgrade
+```
+Then **restart the runtime** (Runtime → Restart runtime) and re-run from the top.
+
+---
+
+## Fix B: The warning is harmless — but verify retrieval is actually working
+
+The BERT status warning is often just a `safetensors` vs `pytorch_bin` format notice. Check if retrieval returns **correct neighbors**:
+
+```python
+# Paste this right after you build the Chroma collection
+test_query = "issue with billing refund dispute in case #5"
+hits = col.query(
+    query_embeddings=enc.encode([test_query]).tolist(),
+    n_results=3
+)
+print("Retrieved labels:", [m['label'] for m in hits['metadatas'][0]])
+print("Retrieved docs:", hits['documents'][0])
+```
+
+**Expected:** You should see labels like `billing.refund_dispute` returned.  
+**If you see random/wrong labels** → the collection is empty or vectors are zeros.
+
+---
+
+## Fix C: Collection is empty — encoding happened before model loaded
+
+The most common cause of 0% accuracy. Add an explicit check:
+
+```python
+print("Collection count:", col.count())  # Must be 200, not 0
+```
+
+If it's 0, re-run the `col.add(...)` block **after** confirming the encoder works.
+
+---
+
+## Fix D: Label comparison is failing (exact string mismatch)
+
+Even if retrieval works, the LLM output might have extra spaces or different casing. Add this debug line:
+
+```python
+# After running preds_r, inspect a few raw outputs
+for i in range(3):
+    print(f"PRED: '{preds_r[i]}'  |  TRUE: '{evals[i]['label']}'")
+```
+
+If you see something like `'billing.refund_dispute '` vs `'billing.refund_dispute'`, fix with:
+
+```python
+acc_r = sum(p.strip().lower() == e['label'].strip().lower() 
+            for p, e in zip(preds_r, evals)) / len(evals)
+```
+
+---
+
+## Fix E: Groq returning the full label list instead of one label
+
+Sometimes the LLM echoes the taxonomy. Check `preds_r[0]` — if it's multi-line, tighten the prompt:
+
+```python
+def classify_rag(text):
+    hits = col.query(query_embeddings=enc.encode([text]).tolist(), n_results=5)
+    shots = '\n'.join(
+        f"Ticket: {d}\nLabel: {m['label']}" 
+        for d, m in zip(hits['documents'][0], hits['metadatas'][0])
+    )
+    r = client.chat.completions.create(
+        model='llama-3.1-8b-instant',
+        messages=[{'role': 'user', 'content': 
+            f'You must respond with ONLY one label from this list, nothing else:\n{TAXONOMY}\n\nExamples:\n{shots}\n\nTicket: {text}\nLabel:'}],
+        temperature=0, max_tokens=20
+    )
+    # Take only the first line of the response
+    return r.choices[0].message.content.strip().split('\n')[0].strip()
+```
+
+---
+
+## Quick Diagnostic Checklist
+
+Run these in order and tell me which one fails:
+
+```python
+# 1. Encoder works?
+print(enc.encode(["test"]).shape)  # (1, 384)
+
+# 2. Collection populated?
+print(col.count())  # 200
+
+# 3. Retrieval returns right labels?
+hits = col.query(query_embeddings=enc.encode(["billing refund"]).tolist(), n_results=3)
+print([m['label'] for m in hits['metadatas'][0]])  # billing.* labels
+
+# 4. Raw LLM
+e.g., 'Step 4 throws ImportError — what am I missing?'
